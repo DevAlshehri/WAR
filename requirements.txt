@@ -1,0 +1,4 @@
+pygame
+stable-baselines3[extra]
+gymnasium
+numba
