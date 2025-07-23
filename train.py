@@ -6,6 +6,7 @@ import os
 import random
 import math
 import numba
+import re
 
 # Stable Baselines3 for Reinforcement Learning
 from stable_baselines3 import PPO
@@ -21,9 +22,9 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 TOTAL_TIMESTEPS = 10_000_000
 NUM_ENVIRONMENTS = 16
 LEARNING_RATE = 0.0003
-N_STEPS = 4096  # Increased for more data per update
-BATCH_SIZE = 1024 # Increased for A40 VRAM
-POLICY_KWARGS = dict(net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128])) # Custom, larger network
+N_STEPS = 4096
+BATCH_SIZE = 1024
+POLICY_KWARGS = dict(net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128]))
 
 # --- Simulation Configuration ---
 TROOP_COUNT = 500
@@ -44,15 +45,13 @@ SOLDIER_RADIUS = 4
 SOLDIER_SPEED = 60
 SOLDIER_HEALTH = 100
 SOLDIER_DAMAGE = 10
-SOLDIER_ATTACK_RANGE_SQ = 40**2 # Use squared distance for performance
+SOLDIER_ATTACK_RANGE_SQ = 40**2
 SOLDIER_ATTACK_COOLDOWN = 1.0
 
-# Numba requires simple data types, so we use tuples for positions instead of Vector2
 @numba.jit(nopython=True)
 def find_target_numba(self_pos, enemy_positions, enemy_aliveness):
-    """Numba-optimized function to find the closest target."""
     closest_enemy_idx = -1
-    min_dist_sq = 1e9 # A large number
+    min_dist_sq = 1e9
     for i in range(len(enemy_positions)):
         if enemy_aliveness[i]:
             dx = self_pos[0] - enemy_positions[i][0]
@@ -69,11 +68,10 @@ class WarSimEnv(gym.Env):
         self.screen_width = 640
         self.screen_height = 480
         
-        self.action_space = spaces.Discrete(3) # 0=ATTACK_COM, 1=HOLD, 2=SPREAD_OUT
+        self.action_space = spaces.Discrete(3)
         self.observation_space = spaces.Box(low=0, high=1, shape=(8,), dtype=np.float32)
 
     def _get_obs(self):
-        # This part remains in Python as it's not the main bottleneck
         blue_alive_indices = np.where((self.teams == 0) & (self.aliveness == 1))[0]
         red_alive_indices = np.where((self.teams == 1) & (self.aliveness == 1))[0]
         
@@ -117,11 +115,11 @@ class WarSimEnv(gym.Env):
 
         for i in range(TROOP_COUNT):
             self.positions[i] = [random.uniform(0, self.screen_width / 4), random.uniform(0, self.screen_height)]
-            self.teams[i] = 0 # Blue
+            self.teams[i] = 0
             
             red_idx = i + TROOP_COUNT
             self.positions[red_idx] = [random.uniform(self.screen_width * 3/4, self.screen_width), random.uniform(0, self.screen_height)]
-            self.teams[red_idx] = 1 # Red
+            self.teams[red_idx] = 1
 
         self.prev_blue_health = np.sum(self.healths[self.teams == 0])
         self.prev_red_health = np.sum(self.healths[self.teams == 1])
@@ -129,24 +127,18 @@ class WarSimEnv(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action):
-        # Run the Numba-optimized simulation update
         self.positions, self.healths, self.aliveness, self.attack_cooldowns, self.targets = self.update_simulation(
             self.positions, self.healths, self.aliveness, self.attack_cooldowns, self.targets, self.teams, self.obstacles, action
         )
-
         self.current_step += 1
         
-        # --- ENHANCED REWARD SHAPING ---
         current_blue_health = np.sum(self.healths[self.teams == 0])
         current_red_health = np.sum(self.healths[self.teams == 1])
-        
         damage_dealt = (self.prev_red_health - current_red_health) * 0.1
         damage_taken = (self.prev_blue_health - current_blue_health) * 0.1
-        
         blue_alive_count = np.sum(self.aliveness[self.teams == 0])
         survival_bonus = blue_alive_count * 0.001
-
-        reward = (damage_dealt - damage_taken) + survival_bonus - 0.01 # Core reward + survival - time penalty
+        reward = (damage_dealt - damage_taken) + survival_bonus - 0.01
         
         self.prev_blue_health = current_blue_health
         self.prev_red_health = current_red_health
@@ -168,57 +160,41 @@ class WarSimEnv(gym.Env):
     @staticmethod
     @numba.jit(nopython=True)
     def update_simulation(positions, healths, aliveness, attack_cooldowns, targets, teams, obstacles, blue_command):
-        dt = 0.1 # Simulation time step
+        dt = 0.1
         num_soldiers = len(positions)
-
-        # Update cooldowns
         for i in range(num_soldiers):
             if attack_cooldowns[i] > 0:
                 attack_cooldowns[i] -= dt
 
-        # AI logic and movement
         for i in range(num_soldiers):
-            if not aliveness[i]:
-                continue
+            if not aliveness[i]: continue
 
-            # --- Target acquisition ---
             if targets[i] != -1 and not aliveness[targets[i]]:
                 targets[i] = -1
-
             if targets[i] == -1:
-                if teams[i] == 0: # Blue team
-                    enemy_indices = np.where((teams == 1) & (aliveness == 1))[0]
-                    if len(enemy_indices) > 0:
-                        targets[i], _ = find_target_numba(positions[i], positions[enemy_indices], aliveness[enemy_indices])
-                        targets[i] = enemy_indices[targets[i]] # Map back to global index
-                else: # Red team
-                    enemy_indices = np.where((teams == 0) & (aliveness == 1))[0]
-                    if len(enemy_indices) > 0:
-                        targets[i], _ = find_target_numba(positions[i], positions[enemy_indices], aliveness[enemy_indices])
-                        targets[i] = enemy_indices[targets[i]] # Map back to global index
+                enemy_indices = np.where((teams != teams[i]) & (aliveness == 1))[0]
+                if len(enemy_indices) > 0:
+                    target_idx, _ = find_target_numba(positions[i], positions[enemy_indices], aliveness[enemy_indices])
+                    targets[i] = enemy_indices[target_idx]
 
-            # --- Action (Attack or Move) ---
             move_direction = np.zeros(2, dtype=np.float32)
             target_idx = targets[i]
             if target_idx != -1:
                 dx = positions[target_idx][0] - positions[i][0]
                 dy = positions[target_idx][1] - positions[i][1]
                 dist_sq = dx*dx + dy*dy
-
                 if dist_sq < SOLDIER_ATTACK_RANGE_SQ:
                     if attack_cooldowns[i] <= 0:
                         healths[target_idx] -= SOLDIER_DAMAGE
-                        if healths[target_idx] <= 0:
-                            aliveness[target_idx] = False
+                        if healths[target_idx] <= 0: aliveness[target_idx] = False
                         attack_cooldowns[i] = SOLDIER_ATTACK_COOLDOWN
                 else:
                     dist = np.sqrt(dist_sq)
                     move_direction[0] = dx / dist
                     move_direction[1] = dy / dist
             else:
-                # Execute high-level command if no tactical target
-                command = blue_command if teams[i] == 0 else 0 # Red team always attacks
-                if command == 0: # ATTACK ENEMY COM
+                command = blue_command if teams[i] == 0 else 0
+                if command == 0:
                     enemy_indices = np.where((teams != teams[i]) & (aliveness == 1))[0]
                     if len(enemy_indices) > 0:
                         enemy_com_x = np.mean(positions[enemy_indices, 0])
@@ -229,15 +205,10 @@ class WarSimEnv(gym.Env):
                         if dist > 1:
                             move_direction[0] = dx / dist
                             move_direction[1] = dy / dist
-                # Commands 1 (HOLD) and 2 (SPREAD_OUT) are simplified for Numba
-                # SPREAD_OUT is complex in Numba, so we focus on the core commands
 
-            # --- Collision and Position Update ---
             if move_direction[0] != 0 or move_direction[1] != 0:
-                # Simplified collision for Numba
                 next_x = positions[i, 0] + move_direction[0] * SOLDIER_SPEED * dt
                 next_y = positions[i, 1] + move_direction[1] * SOLDIER_SPEED * dt
-                
                 collided = False
                 for j in range(len(obstacles)):
                     obs = obstacles[j]
@@ -247,12 +218,25 @@ class WarSimEnv(gym.Env):
                 if not collided:
                     positions[i, 0] = next_x
                     positions[i, 1] = next_y
-
         return positions, healths, aliveness, attack_cooldowns, targets
 
 # ==============================================================================
-# 4. MAIN TRAINING EXECUTION
+# 4. MAIN TRAINING EXECUTION WITH RESUME LOGIC
 # ==============================================================================
+
+def get_latest_checkpoint(path):
+    """Finds the latest model checkpoint in a directory."""
+    if not os.path.isdir(path):
+        return None
+    files = os.listdir(path)
+    checkpoints = [f for f in files if f.startswith("warsim_model_") and f.endswith(".zip")]
+    if not checkpoints:
+        return None
+    
+    # Extract step numbers and find the max
+    steps = [int(re.search(r"(\d+)_steps", f).group(1)) for f in checkpoints]
+    latest_step = max(steps)
+    return os.path.join(path, f"warsim_model_{latest_step}_steps.zip")
 
 if __name__ == '__main__':
     os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
@@ -267,29 +251,48 @@ if __name__ == '__main__':
         name_prefix="warsim_model"
     )
 
-    print("--- Defining PPO Model ---")
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        learning_rate=LEARNING_RATE,
-        n_steps=N_STEPS,
-        batch_size=BATCH_SIZE,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        tensorboard_log=LOG_PATH,
-        policy_kwargs=POLICY_KWARGS,
-        device="cuda"
-    )
+    latest_checkpoint = get_latest_checkpoint(MODEL_SAVE_PATH)
 
-    print(f"--- Starting Training for {TOTAL_TIMESTEPS} Timesteps ---")
-    print(f"Policy Network Architecture: {POLICY_KWARGS['net_arch']}")
+    if latest_checkpoint:
+        print(f"--- Resuming training from {latest_checkpoint} ---")
+        model = PPO.load(
+            latest_checkpoint,
+            env=env,
+            device="cuda",
+            custom_objects={"learning_rate": LEARNING_RATE, "clip_range": 0.2}
+        )
+        # The number of timesteps completed is in the filename
+        completed_steps = int(re.search(r"(\d+)_steps", latest_checkpoint).group(1))
+        remaining_timesteps = TOTAL_TIMESTEPS - completed_steps
+        if remaining_timesteps <= 0:
+            print("--- Training is already complete. ---")
+            exit()
+        print(f"--- Training for an additional {remaining_timesteps} timesteps. ---")
+    else:
+        print("--- Starting a new training run. ---")
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            learning_rate=LEARNING_RATE,
+            n_steps=N_STEPS,
+            batch_size=BATCH_SIZE,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            tensorboard_log=LOG_PATH,
+            policy_kwargs=POLICY_KWARGS,
+            device="cuda"
+        )
+        remaining_timesteps = TOTAL_TIMESTEPS
+
+    print(f"Policy Network Architecture: {model.policy_kwargs['net_arch']}")
     
     model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=checkpoint_callback
+        total_timesteps=remaining_timesteps,
+        callback=checkpoint_callback,
+        reset_num_timesteps=False # IMPORTANT: Do not reset the step counter
     )
 
     final_model_path = os.path.join(MODEL_SAVE_PATH, "warsim_model_final")
